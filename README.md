@@ -2,7 +2,7 @@
 
 Generate Japanese learning subtitles from video files. Each subtitle entry contains three lines:
 
-1. **Japanese** (kanji) — corrected transcription
+1. **Japanese** — transcription with kanji
 2. **Hiragana** — full kana reading
 3. **English** — natural translation
 
@@ -11,11 +11,17 @@ Designed for Japanese learners watching movies, shows, and other video content.
 ## Example Output
 
 ```srt
-1
-00:13:00,980 --> 00:13:12,939
-どうした？ん？おい。よし。どこまで来たの？
-どうした？ん？おい。よし。どこまできたの？
-What's wrong? Hm? Hey. Okay. How far did you get?
+19
+00:13:12,940 --> 00:13:19,500
+大丈夫。よし。
+だいじょうぶ。よし。
+It's gonna be fine. Alright.
+
+24
+00:14:48,080 --> 00:15:00,000
+ドアが閉まります。ご注意ください。
+どあがしまります。ごちゅういください。
+The doors are closing. Please be careful.
 ```
 
 ## Requirements
@@ -82,7 +88,7 @@ The tool reports progress and costs as it runs.
 
 1. **Extract audio** — ffmpeg extracts mono 16kHz MP3 from the video
 2. **Transcribe** — ElevenLabs Scribe (or OpenAI Whisper) produces word-level timestamps, grouped into subtitle segments
-3. **Translate** — GPT corrects transcription errors, generates hiragana readings, and translates to English
+3. **Translate** — GPT generates hiragana readings and English translations, correcting any transcription errors along the way
 4. **Output** — writes a standard SRT file with three lines per entry
 
 ## Note
