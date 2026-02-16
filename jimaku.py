@@ -101,11 +101,15 @@ def probe_duration(path: str) -> float:
 
 
 def extract_audio(video: str, out: str) -> None:
-    """Extract mono 16 kHz / 64 kbps mp3 from a video file."""
+    """Extract mono 16 kHz WAV from a video file.
+
+    WAV is used instead of MP3 to avoid encoder-delay timing drift
+    (~0.14 %/min with MP3, which accumulates to ~10 s over a 2-hour movie).
+    """
     r = subprocess.run(
         ["ffmpeg", "-y", "-i", video,
-         "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
-         "-f", "mp3", out],
+         "-vn", "-ac", "1", "-ar", "16000",
+         "-f", "wav", out],
         capture_output=True,
     )
     if r.returncode != 0:
@@ -167,7 +171,7 @@ def split_audio(
     for i in range(len(boundaries) - 1):
         start = boundaries[i]
         end = boundaries[i + 1]
-        out = os.path.join(chunk_dir, f"chunk_{i:04d}.mp3")
+        out = os.path.join(chunk_dir, f"chunk_{i:04d}.wav")
         subprocess.run(
             ["ffmpeg", "-y", "-i", audio,
              "-ss", str(start), "-to", str(end),
@@ -350,13 +354,19 @@ def transcribe_scribe(api_key: str, path: str) -> list[dict]:
         if not text.strip():
             continue
 
+        # skip stray noise words (single char spanning >10 s)
+        content = re.sub(r'[。！？!?、,.\s…]', '', text)
+        if len(content) <= 1 and (end - start) > 10.0:
+            continue
+
         # decide whether to flush current buffer before adding this word
         if buf:
             gap = start - buf[-1]["end"]
             duration = end - buf[0]["start"]
             prev_text = buf[-1]["text"]
             sentence_break = prev_text and prev_text[-1] in JP_SENT_END
-            if gap > 0.7 or duration > 12.0 or (sentence_break and gap > 0.15):
+            # gap > 5s catches stray words separated by long silences
+            if gap > 5.0 or (gap > 0.7 and duration > 1.0) or duration > 12.0 or (sentence_break and gap > 0.15):
                 seg_text = "".join(b["text"] for b in buf).strip()
                 if seg_text:
                     segments.append({
@@ -377,6 +387,14 @@ def transcribe_scribe(api_key: str, path: str) -> list[dict]:
                 "end": buf[-1]["end"],
                 "text": seg_text,
             })
+
+    # Cap segment duration: don't let a subtitle linger more than 8 s past
+    # the text length (rough estimate: 3 chars/s for Japanese).
+    for seg in segments:
+        text_len = len(re.sub(r'[。！？!?、,.\s…]', '', seg["text"]))
+        max_dur = max(5.0, text_len / 3.0 + 8.0)
+        if seg["end"] - seg["start"] > max_dur:
+            seg["end"] = seg["start"] + max_dur
 
     return segments
 
@@ -559,7 +577,7 @@ def main() -> None:
                 print("  English reference: none (no embedded subs found)")
 
         # ── 1. Extract audio ──────────────────────────────────────────────
-        audio = os.path.join(tmp, "audio.mp3")
+        audio = os.path.join(tmp, "audio.wav")
         print(f"[1/3] Extracting audio from {Path(video_path).name} …")
         t0 = time.time()
         extract_audio(video_path, audio)

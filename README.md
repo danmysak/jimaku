@@ -86,7 +86,7 @@ The tool reports progress and costs as it runs.
 
 ## How It Works
 
-1. **Extract audio** — ffmpeg extracts mono 16kHz MP3 from the video
+1. **Extract audio** — ffmpeg extracts mono 16kHz WAV from the video
 2. **Transcribe** — ElevenLabs Scribe (or OpenAI Whisper) produces word-level timestamps, grouped into subtitle segments
 3. **Translate** — GPT generates hiragana readings and English translations, correcting any transcription errors along the way
 4. **Output** — writes a standard SRT file with three lines per entry
