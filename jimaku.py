@@ -5,26 +5,27 @@ jimaku — Generate Japanese learning subtitles from video/audio files.
 For each subtitle segment produces three lines:
   1. Original Japanese text (kanji)
   2. Hiragana reading
-  3. English translation
+  3. English translation (from existing English subtitles)
 
-Uses OpenAI whisper-1 for timestamped transcription and a GPT model
-to refine the text, add kana readings, and translate to English.
-(gpt-4o-transcribe lacks timestamp support, so whisper-1 is used for
-segmentation; GPT then corrects any recognition errors.)
+Uses ElevenLabs Scribe for Japanese speech transcription, guided by
+English subtitles embedded in the video (or supplied separately).
+An LLM then matches Japanese segments to English subtitles and adds
+hiragana readings.
 
 Requirements:
   - ffmpeg and ffprobe on PATH
   - OPENAI_API_KEY environment variable
-  - pip install openai
+  - ELEVENLABS_API_KEY environment variable
+  - pip install openai elevenlabs
 
 Usage:
   python jimaku.py movie.mkv
   python jimaku.py movie.mkv -o subs.srt
   python jimaku.py movie.mkv --english-srt movie.en.srt
-  python jimaku.py movie.mkv --translation-model gpt-4o-mini
 """
 
 import argparse
+from difflib import SequenceMatcher
 import json
 import math
 import os
@@ -45,13 +46,10 @@ except ImportError:
 try:
     from elevenlabs.client import ElevenLabs
 except ImportError:
-    ElevenLabs = None  # optional; only needed with --asr scribe
+    ElevenLabs = None
 
 # ── Pricing (USD, Feb 2026) ───────────────────────────────────────────────
-TRANSCRIBE_COST_PER_MIN = {
-    "whisper": 0.006,   # whisper-1
-    "scribe":  0.0067,  # ElevenLabs Scribe
-}
+SCRIBE_COST_PER_MIN = 0.0067  # ElevenLabs Scribe
 
 CHAT_PRICING = {                                       # per 1 M tokens
     "gpt-4o":      {"input": 2.50,  "output": 10.00},
@@ -63,8 +61,7 @@ CHAT_PRICING = {                                       # per 1 M tokens
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-CHUNK_SECONDS = 600        # target chunk length; actual splits land on silences
-TRANSLATE_BATCH = 30       # subtitle segments per translation call
+MATCH_BATCH = 30           # English subs per matching call
 MAX_RETRIES = 3
 RETRY_DELAY = 5            # seconds
 
@@ -78,13 +75,13 @@ def fatal(msg: str) -> None:
     sys.exit(1)
 
 
-def check_deps(asr: str) -> None:
+def check_deps() -> None:
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             fatal(f"{tool} not found on PATH. Install ffmpeg first.")
     if not os.environ.get("OPENAI_API_KEY"):
         fatal("OPENAI_API_KEY environment variable is not set.")
-    if asr == "scribe" and not os.environ.get("ELEVENLABS_API_KEY"):
+    if not os.environ.get("ELEVENLABS_API_KEY"):
         fatal("ELEVENLABS_API_KEY environment variable is not set. "
               "Get one at https://elevenlabs.io")
 
@@ -116,62 +113,54 @@ def extract_audio(video: str, out: str) -> None:
         fatal(f"ffmpeg audio extraction failed:\n{r.stderr.decode()[-500:]}")
 
 
-def detect_silences(
-    audio: str, noise_db: int = -30, min_dur: float = 0.5,
-) -> list[tuple[float, float]]:
-    """Return [(start, end), …] silence intervals detected by ffmpeg."""
-    r = subprocess.run(
-        ["ffmpeg", "-i", audio,
-         "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
-         "-f", "null", "-"],
-        capture_output=True, text=True,
-    )
-    starts = [float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", r.stderr)]
-    ends   = [float(m) for m in re.findall(r"silence_end:\s*([\d.]+)",   r.stderr)]
-    return list(zip(starts, ends[: len(starts)]))
 
 
-def pick_split_points(
-    silences: list[tuple[float, float]],
-    total_dur: float,
-    target_sec: int,
-) -> list[float]:
-    """Choose split points at silences closest to each target interval."""
-    points: list[float] = []
-    target = float(target_sec)
-    window = target_sec * 0.3  # search ±30 % around target
-    while target < total_dur - target_sec * 0.25:
-        best, best_dist = target, float("inf")  # fallback: exact target
-        for s_start, s_end in silences:
-            mid = (s_start + s_end) / 2
-            dist = abs(mid - target)
-            if dist < best_dist and dist < window:
-                best, best_dist = mid, dist
-        points.append(best)
-        target = best + target_sec
-    return points
+# ═══════════════════════════════════════════════════════════════════════════
+#  Subtitle-guided chunking
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Padding (seconds) around English subtitle clusters when extracting audio
+_GUIDE_PAD_BEFORE = 2.0   # before the first sub in a cluster
+_GUIDE_PAD_AFTER  = 3.0   # after the last sub in a cluster
+_GUIDE_GAP        = 8.0   # merge subs closer than this into one cluster
 
 
-def split_audio(
+def subtitle_guided_fragments(
     audio: str,
+    en_subs: list[dict],
     chunk_dir: str,
-    target_sec: int,
 ) -> list[tuple[str, float]]:
-    """Split audio at detected silences.
+    """Extract short audio fragments around English subtitle clusters.
 
-    Returns [(chunk_path, chunk_start_seconds), …].
+    Returns [(chunk_path, chunk_start_seconds), …] — same format as
+    split_audio so existing transcribe functions work unchanged.
     """
     total_dur = probe_duration(audio)
 
-    silences = detect_silences(audio)
-    splits = pick_split_points(silences, total_dur, target_sec)
+    # 1. Cluster nearby English subs: merge subs within _GUIDE_GAP of each other
+    clusters: list[tuple[float, float]] = []  # (start, end) of each cluster
+    for sub in sorted(en_subs, key=lambda s: s["start"]):
+        s, e = sub["start"], sub["end"]
+        if clusters and s - clusters[-1][1] < _GUIDE_GAP:
+            clusters[-1] = (clusters[-1][0], max(clusters[-1][1], e))
+        else:
+            clusters.append((s, e))
 
-    boundaries = [0.0] + splits + [total_dur]
+    # 2. Expand with padding and clamp to audio bounds
+    fragments: list[tuple[float, float]] = []
+    for cs, ce in clusters:
+        fs = max(0.0, cs - _GUIDE_PAD_BEFORE)
+        fe = min(total_dur, ce + _GUIDE_PAD_AFTER)
+        # merge with previous fragment if overlapping
+        if fragments and fs <= fragments[-1][1]:
+            fragments[-1] = (fragments[-1][0], max(fragments[-1][1], fe))
+        else:
+            fragments.append((fs, fe))
+
+    # 3. Extract each fragment as a WAV file
     chunks: list[tuple[str, float]] = []
-    for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        out = os.path.join(chunk_dir, f"chunk_{i:04d}.wav")
+    for i, (start, end) in enumerate(fragments):
+        out = os.path.join(chunk_dir, f"frag_{i:04d}.wav")
         subprocess.run(
             ["ffmpeg", "-y", "-i", audio,
              "-ss", str(start), "-to", str(end),
@@ -179,6 +168,7 @@ def split_audio(
             capture_output=True, check=True,
         )
         chunks.append((out, start))
+
     return chunks
 
 
@@ -223,17 +213,6 @@ def parse_srt(path: str) -> list[dict]:
                 "text":  text,
             })
     return entries
-
-
-def find_overlapping_english(
-    seg_start: float, seg_end: float, en_subs: list[dict],
-) -> list[str]:
-    """Return English subtitle texts that overlap the given time range."""
-    result = []
-    for e in en_subs:
-        if e["start"] < seg_end and e["end"] > seg_start:
-            result.append(e["text"])
-    return result
 
 
 def extract_embedded_subs(video: str, tmp_dir: str) -> str | None:
@@ -290,30 +269,94 @@ def _retry(fn, description: str):
             time.sleep(wait)
 
 
-def transcribe_chunk(client: OpenAI, path: str) -> list[dict]:
-    """Transcribe one audio chunk → list of {start, end, text}.
 
-    Uses whisper-1 with verbose_json for segment-level timestamps.
-    (gpt-4o-transcribe does not support timestamps.)
+
+def _group_words(words: list[dict]) -> list[dict]:
+    """Group word-level timestamps into subtitle-sized segments.
+
+    Each word dict must have keys: text, start, end.
+    Returns list of {start, end, text, words}.
     """
-    def call():
-        with open(path, "rb") as f:
-            return client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
-                language="ja",
-            )
-
-    resp = _retry(call, f"Transcribe {Path(path).name}")
     segments: list[dict] = []
-    for seg in (resp.segments or []):
-        text = seg.text.strip()
-        # skip noise / empty segments
-        if text and len(text) > 1:
-            segments.append({"start": seg.start, "end": seg.end, "text": text})
-    return segments
+    buf: list[dict] = []
+    JP_SENT_END = set("。！？!?")
+
+    for w in words:
+        text = w["text"]
+        start = w["start"]
+        end = w["end"]
+        if not text.strip():
+            continue
+
+        # skip stray noise words (single char spanning >10 s)
+        content = re.sub(r'[。！？!?、,.\s…]', '', text)
+        if len(content) <= 1 and (end - start) > 10.0:
+            continue
+
+        # decide whether to flush current buffer before adding this word
+        if buf:
+            gap = start - buf[-1]["end"]
+            duration = end - buf[0]["start"]
+            prev_text = buf[-1]["text"]
+            sentence_break = prev_text and prev_text[-1] in JP_SENT_END
+            if gap > 5.0 or (gap > 0.7 and duration > 1.0) or duration > 12.0 or (sentence_break and gap > 0.15):
+                seg_text = "".join(b["text"] for b in buf).strip()
+                if seg_text:
+                    segments.append({
+                        "start": buf[0]["start"],
+                        "end": buf[-1]["end"],
+                        "text": seg_text,
+                        "words": list(buf),
+                    })
+                buf = []
+
+        buf.append({"start": start, "end": end, "text": text})
+
+    # flush remaining
+    if buf:
+        seg_text = "".join(b["text"] for b in buf).strip()
+        if seg_text:
+            segments.append({
+                "start": buf[0]["start"],
+                "end": buf[-1]["end"],
+                "text": seg_text,
+                "words": list(buf),
+            })
+
+    # Cap segment duration and enforce minimum display time
+    for seg in segments:
+        text_len = len(re.sub(r'[。！？!?、,.\s…]', '', seg["text"]))
+        max_dur = max(5.0, text_len / 3.0 + 8.0)
+        if seg["end"] - seg["start"] > max_dur:
+            seg["end"] = seg["start"] + max_dur
+        # Minimum display duration: 1.5 s
+        if seg["end"] - seg["start"] < 1.5:
+            seg["end"] = seg["start"] + 1.5
+
+    # Filter echo/repeat artifacts
+    def _core(t: str) -> str:
+        return re.sub(r'[。！？!?、,.\s…\u3000]', '', t)
+
+    filtered: list[dict] = []
+    for seg in segments:
+        sc = _core(seg["text"])
+        if not sc:
+            continue
+        is_echo = False
+        for prev in filtered:
+            if abs(seg["start"] - prev["start"]) > 180:
+                continue
+            pc = _core(prev["text"])
+            if len(sc) >= 2 and (sc in pc or pc in sc):
+                is_echo = True
+                break
+            if min(len(sc), len(pc)) >= 4:
+                if SequenceMatcher(None, sc, pc).ratio() > 0.7:
+                    is_echo = True
+                    break
+        if not is_echo:
+            filtered.append(seg)
+    return filtered
 
 
 def transcribe_scribe(api_key: str, path: str) -> list[dict]:
@@ -339,143 +382,157 @@ def transcribe_scribe(api_key: str, path: str) -> list[dict]:
 
     resp = _retry(call, f"Scribe {Path(path).name}")
 
-    # Group words into subtitle-sized segments by pauses and punctuation
-    words = resp.words or []
-    segments: list[dict] = []
-    buf: list[dict] = []
-    JP_SENT_END = set("。！？!?")
-
-    for w in words:
+    # Extract words into a uniform format
+    raw_words = resp.words or []
+    words: list[dict] = []
+    for w in raw_words:
         if getattr(w, "type", "word") != "word":
             continue
         text = w.text if isinstance(w, dict) else getattr(w, "text", "")
         start = w["start"] if isinstance(w, dict) else getattr(w, "start", 0)
         end = w["end"] if isinstance(w, dict) else getattr(w, "end", 0)
-        if not text.strip():
-            continue
+        words.append({"text": text, "start": start, "end": end})
 
-        # skip stray noise words (single char spanning >10 s)
-        content = re.sub(r'[。！？!?、,.\s…]', '', text)
-        if len(content) <= 1 and (end - start) > 10.0:
-            continue
-
-        # decide whether to flush current buffer before adding this word
-        if buf:
-            gap = start - buf[-1]["end"]
-            duration = end - buf[0]["start"]
-            prev_text = buf[-1]["text"]
-            sentence_break = prev_text and prev_text[-1] in JP_SENT_END
-            # gap > 5s catches stray words separated by long silences
-            if gap > 5.0 or (gap > 0.7 and duration > 1.0) or duration > 12.0 or (sentence_break and gap > 0.15):
-                seg_text = "".join(b["text"] for b in buf).strip()
-                if seg_text:
-                    segments.append({
-                        "start": buf[0]["start"],
-                        "end": buf[-1]["end"],
-                        "text": seg_text,
-                    })
-                buf = []
-
-        buf.append({"start": start, "end": end, "text": text})
-
-    # flush remaining
-    if buf:
-        seg_text = "".join(b["text"] for b in buf).strip()
-        if seg_text:
-            segments.append({
-                "start": buf[0]["start"],
-                "end": buf[-1]["end"],
-                "text": seg_text,
-            })
-
-    # Cap segment duration: don't let a subtitle linger more than 8 s past
-    # the text length (rough estimate: 3 chars/s for Japanese).
-    for seg in segments:
-        text_len = len(re.sub(r'[。！？!?、,.\s…]', '', seg["text"]))
-        max_dur = max(5.0, text_len / 3.0 + 8.0)
-        if seg["end"] - seg["start"] > max_dur:
-            seg["end"] = seg["start"] + max_dur
-
-    return segments
+    return _group_words(words)
 
 
-def translate_batch(
+def match_batch(
     client: OpenAI,
-    texts: list[str],
+    ja_segments: list[dict],
+    en_subs: list[dict],
     model: str,
-    english_hints: list[str] | None = None,
+    reasoning_effort: str | None = None,
+    debug_dir: str | None = None,
+    batch_label: str = "",
 ) -> tuple[list[dict], int, int]:
-    """
-    Send a batch of Japanese lines → returns (results, prompt_tokens, completion_tokens).
-    Each result: {"index": int, "japanese": str, "kana": str, "english": str}
-    *english_hints* is an optional list (one per text) of reference English
-    translations to guide correction and translation.
-    """
-    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+    """Match Japanese ASR text to English subtitles via LLM.
 
-    hint_block = ""
-    if english_hints:
-        hint_lines = "\n".join(
-            f"{i+1}. {h}" for i, h in enumerate(english_hints) if h
-        )
-        if hint_lines:
-            hint_block = (
-                "\n\n--- REFERENCE ENGLISH SUBTITLES (same numbering) ---\n"
-                + hint_lines
-            )
+    The Japanese segments are combined into a single block of text and
+    the LLM is asked to split/redistribute it to match each English
+    subtitle.  This avoids dropping subs when Scribe grouped words
+    differently than the English track.
 
-    en_rule = ""
-    if english_hints:
-        en_rule = (
-            "• english: use the reference English subtitle as a starting point "
-            "but adjust it so it accurately reflects the Japanese audio. "
-            "If no reference is available for a line, translate from scratch.\n"
-        )
-    else:
-        en_rule = "• english: a natural, concise translation.\n"
+    Returns (results, prompt_tokens, completion_tokens).
+    Each result: {"en_index": int, "japanese": str, "kana": str}
+    where en_index is the 1-based position in the *en_subs* list.
+    """
+    # Combine all Japanese segments with clause-level timestamps
+    JP_CLAUSE_END = set("。！？!?")
+    ja_lines = []
+    for s in ja_segments:
+        words = s.get("words", [])
+        if not words:
+            ja_lines.append(s["text"])
+            continue
+        # Merge character-level tokens into clauses split at
+        # sentence-ending punctuation or gaps > 1s
+        clauses: list[tuple[float, str]] = []  # (start_time, text)
+        clause_start = words[0]["start"]
+        clause_text = ""
+        for i, w in enumerate(words):
+            clause_text += w["text"]
+            is_end = w["text"] and w["text"][-1] in JP_CLAUSE_END
+            gap_after = (words[i + 1]["start"] - w["end"]
+                         if i + 1 < len(words) else 999)
+            if is_end or gap_after > 1.0:
+                clauses.append((clause_start, clause_text))
+                clause_text = ""
+                if i + 1 < len(words):
+                    clause_start = words[i + 1]["start"]
+        if clause_text:
+            clauses.append((clause_start, clause_text))
+        ja_lines.append(" ".join(
+            f"[{t:.1f}s]{txt}" for t, txt in clauses
+        ))
+    ja_text = "\n".join(ja_lines)
+
+    en_lines = "\n".join(
+        f"E{i+1}. [{s['start']:.1f}s] {s['text']}" for i, s in enumerate(en_subs)
+    )
 
     system_prompt = (
         "You are a Japanese-language expert.\n"
-        "The user provides numbered Japanese sentences from an "
-        "automatic speech-recognition transcript (whisper)."
-        + (
-            " Reference English subtitles for the same scene are also "
-            "provided — use them to better understand context, fix "
-            "recognition errors, and improve translations."
-            if english_hints else ""
-        )
-        + "\nFor each sentence, return a JSON object:\n"
-        '{\"results\": [{\"index\": 1, '
-        '\"japanese\": \"<corrected Japanese text>\", '
-        '\"kana\": \"<full hiragana reading>\", '
-        '\"english\": \"<natural English translation>\"}, …]}\n'
+        "The user provides:\n"
+        "1) Japanese speech from automatic speech recognition, with "
+        "word-level timestamps in seconds [Xs].\n"
+        "2) Numbered English subtitles with timestamps — the "
+        "professional translation of the same scene.\n\n"
+        "Your task: for EVERY English subtitle, find and extract "
+        "the corresponding Japanese words using TIMESTAMPS to "
+        "align them. Words whose timestamps fall near an English "
+        "subtitle's timestamp belong to that subtitle.\n\n"
+        "• Fix recognition errors, wrong kanji, or garbled text "
+        "using the English subtitle as context.\n"
+        "• Provide the full hiragana reading of the corrected "
+        "Japanese.\n\n"
+        "Return JSON:\n"
+        '{"results": [{"en_index": 1, '
+        '"japanese": "<corrected Japanese>", '
+        '"kana": "<hiragana reading>"}, ...]}\n\n'
         "Rules:\n"
-        "• japanese: fix any obvious recognition errors, wrong "
-        "kanji, or garbled text while keeping the original "
-        "meaning. If the text looks correct, keep it as-is.\n"
-        "• kana: the complete hiragana reading of the corrected "
-        "sentence (convert all kanji and katakana).\n"
-        + en_rule
-        + "• Preserve original ordering.\n"
+        "• en_index: the E-number of the English subtitle.\n"
+        "• Use TIMESTAMPS as the primary signal for matching. "
+        "Japanese words at time T should match the English "
+        "subtitle closest to time T.\n"
+        "• Produce a result for EVERY English subtitle that "
+        "corresponds to spoken dialogue. Only skip subtitles "
+        "that describe non-speech sounds like "
+        '"[music]", "[door closes]", etc.\n'
+        "• IMPORTANT: use ONLY the Japanese text from the ASR "
+        "block. Do NOT invent or fabricate Japanese that is not "
+        "present in the ASR output. If the ASR block has no "
+        "corresponding Japanese for an English subtitle, skip it.\n"
+        "• You may fix minor ASR errors (wrong kanji, garbled "
+        "characters) but the underlying words must come from the "
+        "ASR block.\n"
+        "• japanese: corrected Japanese text for that line.\n"
+        "• kana: complete hiragana reading (convert all "
+        "kanji/katakana).\n"
+        "• Preserve the order of en_index.\n"
         "• Return ONLY valid JSON, nothing else."
     )
 
-    user_content = numbered + hint_block
+    user_content = (
+        "--- JAPANESE SPEECH (ASR) ---\n" + ja_text
+        + "\n\n--- ENGLISH SUBTITLES ---\n" + en_lines
+    )
 
     def call():
-        return client.chat.completions.create(
+        kwargs = dict(
             model=model,
-            temperature=0.3,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
         )
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+        else:
+            kwargs["temperature"] = 0.3
+        return client.chat.completions.create(**kwargs)
 
-    resp = _retry(call, "Translation batch")
-    data = json.loads(resp.choices[0].message.content)
+    resp = _retry(call, "Matching batch")
+    raw_content = resp.choices[0].message.content
+    data = json.loads(raw_content)
     results = data.get("results", [])
+
+    if debug_dir:
+        tag = batch_label or "batch"
+        with open(os.path.join(debug_dir, f"{tag}_prompt_system.txt"), "w") as f:
+            f.write(system_prompt)
+        with open(os.path.join(debug_dir, f"{tag}_prompt_user.txt"), "w") as f:
+            f.write(user_content)
+        with open(os.path.join(debug_dir, f"{tag}_response.json"), "w") as f:
+            json.dump({"raw": raw_content, "parsed": data,
+                       "usage": {"prompt": resp.usage.prompt_tokens,
+                                 "completion": resp.usage.completion_tokens}},
+                      f, ensure_ascii=False, indent=2)
+        with open(os.path.join(debug_dir, f"{tag}_ja_segments.json"), "w") as f:
+            json.dump(ja_segments, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(debug_dir, f"{tag}_en_subs.json"), "w") as f:
+            json.dump(en_subs, f, ensure_ascii=False, indent=2)
+
     return results, resp.usage.prompt_tokens, resp.usage.completion_tokens
 
 
@@ -526,55 +583,58 @@ def main() -> None:
     ap.add_argument("video", help="Path to video or audio file")
     ap.add_argument("-o", "--output",
                     help="Output .srt path (default: <input>.srt)")
-    ap.add_argument("--asr", default="scribe",
-                    choices=["whisper", "scribe"],
-                    help="ASR engine: whisper (OpenAI) or scribe "
-                         "(ElevenLabs, better quality) (default: scribe)")
-    ap.add_argument("--translation-model", default="gpt-4.1",
-                    help="Model for kana/translation (default: gpt-4.1)")
-    ap.add_argument("--chunk-duration", type=int, default=CHUNK_SECONDS,
-                    help="Audio chunk length in seconds (default: 600)")
+    ap.add_argument("--model", default="gpt-5.2",
+                    help="LLM for matching/kana (default: gpt-5.2)")
     ap.add_argument("--english-srt",
-                    help="Path to English .srt subtitles (improves "
-                         "transcription correction and translation)")
-    ap.add_argument("--batch-size", type=int, default=TRANSLATE_BATCH,
-                    help="Segments per translation API call (default: 30)")
+                    help="Path to English .srt subtitles (default: "
+                         "auto-extract from video)")
+    ap.add_argument("--batch-size", type=int, default=MATCH_BATCH,
+                    help="English subs per LLM call (default: 30)")
+    ap.add_argument("--thinking", default="medium",
+                    choices=["low", "medium", "high"],
+                    help="Reasoning effort level (default: medium)")
+    ap.add_argument("--debug-dir",
+                    help="Save debug info (API inputs/outputs, segments) "
+                         "to this directory")
     args = ap.parse_args()
 
     # ── Validate ──────────────────────────────────────────────────────────
     video_path = args.video
     if not os.path.isfile(video_path):
         fatal(f"File not found: {video_path}")
-    check_deps(args.asr)
+    check_deps()
 
     out_path = args.output or str(Path(video_path).with_suffix(".srt"))
     client = OpenAI()
+    debug_dir = args.debug_dir
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
 
     cost_transcribe = 0.0
-    cost_translate = 0.0
+    cost_match = 0.0
     tok_in = 0
     tok_out = 0
 
     print(f"\n  jimaku — Japanese learning subtitle generator\n")
 
     with tempfile.TemporaryDirectory(prefix="jimaku_") as tmp:
-        # ── Load English reference subs ───────────────────────────────────
+        # ── Load English subtitles (required) ─────────────────────────────
         en_subs: list[dict] = []
         if args.english_srt:
             if not os.path.isfile(args.english_srt):
                 fatal(f"English SRT not found: {args.english_srt}")
             en_subs = parse_srt(args.english_srt)
-            print(f"  English reference: {len(en_subs)} subtitles "
-                  f"loaded from {Path(args.english_srt).name}")
+            print(f"  English subtitles: {len(en_subs)} loaded from "
+                  f"{Path(args.english_srt).name}")
         else:
-            # try to extract English subs embedded in the video
             embedded = extract_embedded_subs(video_path, tmp)
             if embedded:
                 en_subs = parse_srt(embedded)
-                print(f"  English reference: {len(en_subs)} subtitles "
-                      f"extracted from video")
+                print(f"  English subtitles: {len(en_subs)} extracted "
+                      f"from video")
             else:
-                print("  English reference: none (no embedded subs found)")
+                fatal("No English subtitles found. Provide one with "
+                      "--english-srt or embed in the video file.")
 
         # ── 1. Extract audio ──────────────────────────────────────────────
         audio = os.path.join(tmp, "audio.wav")
@@ -586,113 +646,119 @@ def main() -> None:
         print(f"       Duration: {dur_m:.1f} min  |  "
               f"Extracted in {time.time() - t0:.1f}s")
 
-        # ── 2–3. Transcribe ───────────────────────────────────────────────
-        asr = args.asr
-        asr_cost_per_min = TRANSCRIBE_COST_PER_MIN[asr]
+        # ── 2. Transcribe (subtitle-guided Scribe) ───────────────────────
+        chunk_dir = os.path.join(tmp, "guide_frags")
+        os.makedirs(chunk_dir)
+        frags = subtitle_guided_fragments(audio, en_subs, chunk_dir)
+        frag_min = sum(probe_duration(p) for p, _ in frags) / 60
+
+        print(f"[2/3] Transcribing (ElevenLabs Scribe) …")
+        print(f"       {len(frags)} fragment(s) around English subs  "
+              f"({frag_min:.1f} min of {dur_m:.1f} min)")
+
         all_segs: list[dict] = []
-
-        if asr == "scribe":
-            print(f"[2/3] Transcribing (ElevenLabs Scribe) …")
-            t0 = time.time()
-            all_segs = _retry(
-                lambda: transcribe_scribe(
-                    os.environ["ELEVENLABS_API_KEY"], audio,
+        t0 = time.time()
+        for fi, (fpath, frag_start) in enumerate(frags):
+            segs = _retry(
+                lambda p=fpath: transcribe_scribe(
+                    os.environ["ELEVENLABS_API_KEY"], p,
                 ),
-                "Scribe transcription",
+                f"Scribe fragment {fi + 1}",
             )
-            cost_transcribe = dur_m * asr_cost_per_min
-            print(f"       {len(all_segs)} segments  ({time.time() - t0:.1f}s)  "
-                  f"cost: ${cost_transcribe:.4f}")
-        else:
-            # whisper: split at silences, transcribe each chunk
-            chunk_dir = os.path.join(tmp, "chunks")
-            os.makedirs(chunk_dir)
-            print(f"[2/3] Splitting & transcribing (whisper-1) …")
-            chunks = split_audio(audio, chunk_dir, args.chunk_duration)
-            print(f"       {len(chunks)} chunk(s)  "
-                  f"(split at silence boundaries)")
-            for ci, (cpath, chunk_start) in enumerate(chunks):
-                t0 = time.time()
-                segs = transcribe_chunk(client, cpath)
-                for s in segs:
-                    s["start"] += chunk_start
-                    s["end"]   += chunk_start
-                all_segs.extend(segs)
-                chunk_min = probe_duration(cpath) / 60
-                cost_transcribe += chunk_min * asr_cost_per_min
-                print(f"       Chunk {ci + 1}/{len(chunks)}: "
-                      f"{len(segs)} segments  ({time.time() - t0:.1f}s)  "
-                      f"cost so far: ${cost_transcribe:.4f}")
+            for s in segs:
+                s["start"] += frag_start
+                s["end"]   += frag_start
+                for w in s.get("words", []):
+                    w["start"] += frag_start
+                    w["end"]   += frag_start
+            all_segs.extend(segs)
+            if (fi + 1) % 10 == 0 or fi == len(frags) - 1:
+                print(f"       Fragment {fi + 1}/{len(frags)}: "
+                      f"{len(segs)} segments")
 
-        print(f"       ✓ {len(all_segs)} segments total  |  "
-              f"Transcription cost: ${cost_transcribe:.4f}")
+        cost_transcribe = frag_min * SCRIBE_COST_PER_MIN
+        print(f"       ✓ {len(all_segs)} segments  "
+              f"({time.time() - t0:.1f}s)  "
+              f"cost: ${cost_transcribe:.4f}")
 
         if not all_segs:
             fatal("No speech segments detected.")
 
-        # deduplicate whisper hallucinations (repeated identical text)
-        before = len(all_segs)
-        deduped: list[dict] = []
-        for seg in all_segs:
-            if deduped and seg["text"] == deduped[-1]["text"]:
-                deduped[-1]["end"] = seg["end"]  # merge timespan
+        if debug_dir:
+            with open(os.path.join(debug_dir, "en_subs.json"), "w") as f:
+                json.dump(en_subs, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(debug_dir, "scribe_segments.json"), "w") as f:
+                json.dump(all_segs, f, ensure_ascii=False, indent=2)
+
+        # ── 3. Match Japanese → English subs + add kana ───────────────────
+        model = args.model
+        reasoning_effort = args.thinking
+        # Split into batches at large time gaps, with a max size cap.
+        batch_size = args.batch_size
+        batches: list[list[dict]] = []
+        cur_batch: list[dict] = [en_subs[0]]
+        for s in en_subs[1:]:
+            gap = s["start"] - cur_batch[-1]["end"]
+            if len(cur_batch) >= batch_size or gap > _GUIDE_GAP:
+                batches.append(cur_batch)
+                cur_batch = [s]
             else:
-                deduped.append(seg)
-        all_segs = deduped
-        if len(all_segs) < before:
-            print(f"       Merged {before - len(all_segs)} duplicate "
-                  f"segment(s) → {len(all_segs)} remaining")
+                cur_batch.append(s)
+        batches.append(cur_batch)
+        n_batches = len(batches)
+        think_label = f" (thinking={reasoning_effort})" if reasoning_effort else ""
+        print(f"[3/3] Matching with {model}{think_label}  "
+              f"({n_batches} batch(es) of ≤{batch_size}) …")
 
-        # ── Translate + kana ───────────────────────────────────────────
-        model = args.translation_model
-        n_batches = math.ceil(len(all_segs) / args.batch_size)
-        print(f"[3/3] Translating with {model}  "
-              f"({n_batches} batch(es) of ≤{args.batch_size}) …")
-
-        for bi in range(n_batches):
+        final_segs: list[dict] = []
+        for bi, batch_en in enumerate(batches):
             t0 = time.time()
-            lo = bi * args.batch_size
-            hi = min(lo + args.batch_size, len(all_segs))
-            batch_segs = all_segs[lo:hi]
-            batch_texts = [s["text"] for s in batch_segs]
 
-            # Build per-segment English hints from reference subs
-            en_hints: list[str] | None = None
-            if en_subs:
-                en_hints = []
-                for seg in batch_segs:
-                    overlaps = find_overlapping_english(
-                        seg["start"], seg["end"], en_subs,
-                    )
-                    en_hints.append(" | ".join(overlaps) if overlaps else "")
+            # Time range for this English batch (with padding)
+            t_start = batch_en[0]["start"] - _GUIDE_PAD_BEFORE - 5
+            t_end = batch_en[-1]["end"] + _GUIDE_PAD_AFTER + 5
+            batch_ja = [
+                s for s in all_segs
+                if s["start"] < t_end and s["end"] > t_start
+            ]
 
-            results, p_tok, c_tok = translate_batch(
-                client, batch_texts, model, english_hints=en_hints,
+            results, p_tok, c_tok = match_batch(
+                client, batch_ja, batch_en, model,
+                reasoning_effort=reasoning_effort,
+                debug_dir=debug_dir,
+                batch_label=f"batch_{bi+1:03d}",
             )
             tok_in += p_tok
             tok_out += c_tok
             batch_cost = translation_cost(model, p_tok, c_tok)
             if batch_cost is not None:
-                cost_translate += batch_cost
+                cost_match += batch_cost
 
-            # merge results back
+            # Build output segments using English sub timing
             for r in results:
-                idx = lo + r["index"] - 1
-                if 0 <= idx < len(all_segs):
-                    if r.get("japanese"):
-                        all_segs[idx]["text"] = r["japanese"]
-                    all_segs[idx]["kana"] = r.get("kana", "")
-                    all_segs[idx]["english"] = r.get("english", "")
+                ei = r.get("en_index", 0) - 1   # 1-based → 0-based
+                if not (0 <= ei < len(batch_en)):
+                    continue
+                en = batch_en[ei]
+                final_segs.append({
+                    "start":   en["start"],
+                    "end":     en["end"],
+                    "text":    r.get("japanese", ""),
+                    "kana":    r.get("kana", ""),
+                    "english": en["text"],
+                })
 
-            cost_str = (f"${cost_translate:.4f}"
-                        if cost_translate > 0 else "unknown (see tokens)")
+            cost_str = (f"${cost_match:.4f}"
+                        if cost_match > 0 else "unknown (see tokens)")
             print(f"       Batch {bi + 1}/{n_batches}: "
-                  f"{hi - lo} segments  ({time.time() - t0:.1f}s)  "
-                  f"cost so far: {cost_str}")
+                  f"{len(batch_en)} en subs × {len(batch_ja)} ja segs  "
+                  f"({time.time() - t0:.1f}s)  cost so far: {cost_str}")
 
-        cost_str = (f"${cost_translate:.4f}"
-                    if cost_translate > 0 else "unknown pricing")
-        print(f"       ✓ Translation cost: {cost_str}")
+        cost_str = (f"${cost_match:.4f}"
+                    if cost_match > 0 else "unknown pricing")
+        print(f"       ✓ Matching cost: {cost_str}")
+
+        all_segs = final_segs
 
     # ── Write SRT ─────────────────────────────────────────────────────────
     write_srt(all_segs, out_path)
@@ -704,15 +770,15 @@ def main() -> None:
     print(f"  Audio duration:    {dur_m:.1f} min")
     print(f"  ─────────────────────────────────────")
     print(f"  Transcription:     ${cost_transcribe:.4f}")
-    if cost_translate > 0:
-        total = cost_transcribe + cost_translate
-        print(f"  Translation:       ${cost_translate:.4f}  "
+    if cost_match > 0:
+        total = cost_transcribe + cost_match
+        print(f"  Matching:          ${cost_match:.4f}  "
               f"({tok_in:,} in / {tok_out:,} out tokens)")
         print(f"  TOTAL COST:        ${total:.4f}")
     else:
-        print(f"  Translation:       unknown pricing  "
+        print(f"  Matching:          unknown pricing  "
               f"({tok_in:,} in / {tok_out:,} out tokens)")
-        print(f"  TOTAL COST:        ${cost_transcribe:.4f} + translation")
+        print(f"  TOTAL COST:        ${cost_transcribe:.4f} + matching")
     print("═" * 60)
 
 
